@@ -1,0 +1,13 @@
+# Third-party reference material (not ours to redistribute)
+inspiration/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.log
+
+# Local Claude Code settings
+.claude/settings.local.json

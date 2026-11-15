@@ -1,0 +1,26 @@
+Copyright (c) 2026 Axel Furtenbach
+All rights reserved.
+
+This repository and its contents (source code, stylesheets, shaders, images and
+documentation) are the exclusive property of the copyright holder.
+
+The source is published for viewing only. No license or other right is granted
+to use, copy, modify, merge, publish, distribute, sublicense, sell, host or
+create derivative works of any part of this repository, in whole or in part,
+without the prior written permission of the copyright holder.
+
+Viewing the source code on GitHub, and using the official hosted version at
+https://axel0806.github.io/event-horizon/ for personal, non-commercial
+listening, are permitted.
+
+Third-party components keep their own licenses. The web fonts Outfit, Pirata One
+and JetBrains Mono are loaded from Google Fonts under the SIL Open Font License 1.1
+and are not covered by this notice.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF
+OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+For permission requests, open an issue at https://github.com/axel0806/event-horizon.
