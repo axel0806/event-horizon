@@ -20,8 +20,8 @@ Each file exposes one global: `Tags`, `Library`, `Space`, `Rain`, and `EventHori
 | `index.html` | Markup, inline SVG icon sprite (`#i-*` symbols), hidden file inputs, `<audio>` |
 | `css/styles.css` | All styling. Design tokens in `:root`; `--energy` (0–1 bass level) is set from JS each frame |
 | `js/app.js` | Controller: state, playback, queue, import, Web Audio graph, waveform, card tilt, keyboard, Media Session |
-| `js/space.js` | WebGL black-hole ray tracer (GLSL in template strings), traced into an RGBA8 texture, then a post chain (bloom/halation pyramid, lens softness, grain, rain fog) draws to the canvas inside `frame()`. API: `create(canvas, opts) → {ok, frame, setEnergy, setLook, setRain, stats}` |
-| `js/rain.js` | Rain-on-glass WebGL overlay (`#rain`, above the stage, below queue/drop/toasts, no pointer events). Drops refract a snapshot of `#space`; `rain.frame(now)` must run right after `space.frame(now)`. API: `create(canvas, source, {masks, fog}) → {frame, setEnabled, stats}` |
+| `js/space.js` | WebGL black-hole ray tracer (GLSL in template strings), traced into an RGBA8 texture, then a post chain (bloom/halation pyramid, lens softness, grain, rain fog) draws to the canvas inside `frame()`. Backgrounds: the black hole plus `SCENE_SRC` scenes (`mountain`, `sea`, `nebula`; list in `Space.SCENES`), all writing the same R/G format into the post chain; compiled in the background with `KHR_parallel_shader_compile`. API: `create(canvas, opts) → {ok, frame, setEnergy, setLook, setRain, setScene, scene, shownScene, stats}` |
+| `js/rain.js` | Rain, on two WebGL surfaces: the window (`#rain`, full screen, above the stage, below queue/drop/toasts) with falling streaks (refracting, wind-gusted, hidden behind card/dock) and incoming drops, and the card (`#rainCard` inside `.face`, tilts with it; rougher glass, more friction). Water running off the card's bottom edge becomes a window-layer drip that hangs, swells and falls. Each surface: CPU drop sim (merge, steering slides, trails, drying) → half-float metaball field → lens shading refracting a snapshot of what is behind it (scene + vignette + card/dock replica, or the card replica). `rain.frame(now)` must run right after `space.frame(now)`. API: `create(canvas, {scene, face, dock, card, quality}) → {ok, frame, setEnabled, stats}` |
 | `js/tags.js` | Metadata/cover parser: ID3v2/v1, FLAC, Ogg, MP4, WAV/AIFF. `Tags.read(file) → {title, artist, album, picture} | null`, never throws |
 | `js/library.js` | IndexedDB store `event-horizon/tracks`; records hold the audio `File` blob itself |
 
@@ -47,7 +47,12 @@ Each file exposes one global: `Tags`, `Library`, `Space`, `Rain`, and `EventHori
 - **No-WebGL fallback**: `#space.fallback` shows `assets/blackhole-{wide,tall}.jpg`, stills rendered from the real shader
   via `Space.create(canvas, {scale: 1})` in headless Edge. Re-render them if the shader's look changes. LibreWolf and other
   hardened Firefox builds disable WebGL by default (`webgl.disabled`).
-- Session state (current track, position, volume, shuffle, repeat, mono) lives in `localStorage['eventHorizon.session']`.
+- Session state (current track, position, volume, shuffle, repeat, mono, rain, scene, recShape) lives in `localStorage['eventHorizon.session']`.
+
+- **The view is the body, not the window.** `body` is a size container: use container queries (`@container view`) and
+  cq units/percentages, never media queries on width/height or vw/vh. Recording lays the site out in a frame
+  (`body.framed`); JS that needs the view size must read the body when framed (see `viewSize()` in space.js/rain.js).
+- Recording (`V`): tab capture cropped to the frame on a canvas + Web Audio tap (`recTap`, before the volume gain).
 
 ## Design rules
 - Monochrome only: white on black, with no accent colours. Glass surfaces, thin bright edges, soft glow.
@@ -57,10 +62,10 @@ Each file exposes one global: `Tags`, `Library`, `Space`, `Rain`, and `EventHori
 
 ## Shortcuts
 Space/K play · ←/→ seek 5 s · Shift+←/→ prev/next · ↑/↓ volume · M mute · S shuffle · R repeat ·
-C colour art · W rain · Q queue · O open files · 0–9 jump to 0–90 % · Esc close queue
+C colour art · W rain · B background (Shift+B back) · V record (Shift+V this song) · Q queue · O open files · 0–9 jump to 0–90 % · Esc close queue
 
 ## Testing
 There is no test suite. Verify by driving headless Edge over the DevTools protocol: set files on `#fileInput` with
 `DOM.setFileInputFiles` (use an objectId), then inspect `window.EventHorizon.state` and take screenshots. Call
 `Page.bringToFront` and emulate focus, otherwise the page can stay `hidden`: no rAF, and media never loads.
-Generate test media with ffmpeg (`aevalsrc` audio + `-disposition:v attached_pic` for covers).
+Always launch headless Edge with `--mute-audio` (test tones otherwise play through the user's speakers) and `--use-angle=d3d11 --enable-gpu --ignore-gpu-blocklist` so WebGL runs on the real GPU (without it, it falls back to SwiftShader on the CPU, and the black hole pins the CPU). To check the rain, load the page without `space.js`/`app.js`, draw `assets/blackhole-wide.jpg` into `#space` as a stand-in scene, and call `frame()` with synthetic timestamps. Generate test media with ffmpeg (`aevalsrc` audio + `-disposition:v attached_pic` for covers).

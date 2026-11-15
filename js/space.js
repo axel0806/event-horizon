@@ -7,6 +7,7 @@
  *   space.setEnergy(0..1);       // bass level, brightens the disk
  *   space.setLook(x, y);         // -1..1 pointer parallax
  *   space.setRain(0..1);         // fogs/blurs the image like a wet window (eased over ~1 s)
+ *   space.setScene(id);          // 'horizon' (the black hole), 'mountain', 'sea', 'nebula'; see Space.SCENES
  *
  * The trace renders into a texture; a post chain adds bloom/halation, lens softness and film grain,
  * and draws the final image to the canvas inside frame().
@@ -259,6 +260,415 @@ void main() {
   gl_FragColor = vec4(lum, clamp(hdr * 0.2, 0.0, 1.0), 0.0, 1.0);
 }`;
 
+  // ---------------------------------------------------------------- other backgrounds
+  // Each writes the same format as the black hole (R: tone-mapped value, G: linear luminance / 5), so the post
+  // chain (bloom, lens softness, grain, rain fog) and the rain overlay work unchanged. Compiled on first use.
+  const SCENE_SRC = {
+    mountain: `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform vec2  uRes;
+uniform float uTime;
+uniform float uEnergy;
+uniform vec2  uLook;
+uniform float uDetail;
+
+float h21(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+vec2 h22(vec2 p) { float n = h21(p); return vec2(n, h21(p + n + 3.1)); }
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), f.x), mix(h21(i + vec2(0.0, 1.0)), h21(i + 1.0), f.x), f.y);
+}
+float fbm(vec2 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) { s += a * vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p + 7.7; a *= 0.5; }
+  return s;
+}
+float fbm3(vec2 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 3; i++) { s += a * vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p + 7.7; a *= 0.5; }
+  return s;
+}
+// 1D terrain noise along x
+float n1(float x, float seed) { return vnoise(vec2(x, seed)); }
+float ridge1(float x, float seed) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) { s += a * (1.0 - abs(2.0 * n1(x, seed) - 1.0)); x = x * 2.07 + 3.1; a *= 0.5; }
+  return s;
+}
+// Point stars, one per cell, a few bright, most faint; sharp to a pixel; gentle twinkle.
+float starLayer(vec2 uv, float scale, float seed, float keep) {
+  vec2 g = uv * scale + seed;
+  vec2 id = floor(g);
+  vec2 o = h22(id) - 0.5;
+  float b = h21(id + 11.3);
+  vec2 d = (fract(g) - 0.5 - o * 0.8) / scale * uRes.y;     // pixels
+  float tw = 0.75 + 0.25 * sin(uTime * (1.5 + 3.0 * b) + b * 40.0);
+  float s = (b - (1.0 - keep)) / keep;                     // only a fraction 'keep' of cells holds a star
+  return step(0.0, s) * (0.15 + 0.85 * pow(max(s, 0.0), 3.0)) * exp(-dot(d, d) * 1.7) * 2.2 * tw;
+}
+float stars(vec2 uv) {
+  return starLayer(uv, 30.0, 0.0, 0.16) + starLayer(uv, 64.0, 5.3, 0.07) * 0.7 + starLayer(uv, 130.0, 9.1, 0.03) * 0.5 * uDetail;
+}
+// Same output format as the black hole: R display value, G linear luminance / 5 for bloom.
+vec4 outLum(float L) {
+  float c = L * 1.15;
+  float tm = (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14);
+  return vec4(clamp(tm, 0.0, 1.0), clamp(c * 0.2, 0.0, 1.0), 0.0, 1.0);
+}
+
+// Lonely Mountain: a ray-marched, moonlit, snow-covered peak.
+// Terrain: eroded fBm (value noise with analytic derivatives; steep areas get less fine detail, which carves
+// ridges and gullies) on top of one tall summit. Lit by the moon in the sky, with soft self-shadowing, slope-based
+// snow, distance haze and drifting valley mist.
+const mat2 M2 = mat2(0.8, -0.6, 0.6, 0.8);
+const vec3 MOON = vec3(-0.3378, 0.2969, 0.8929);   // where the moon is drawn: low, upper left of the view
+// Where the light comes from: the side (a painter's cheat; true backlight would leave every face we see dark).
+const vec3 LIGHT = vec3(-0.8697, 0.4246, -0.2516);  // normalize(-0.85, 0.415, -0.246)
+const vec2 PEAK = vec2(4.3, 11.0);
+
+vec3 noised(vec2 x) {
+  vec2 p = floor(x), f = fract(x);
+  vec2 u = f * f * (3.0 - 2.0 * f), du = 6.0 * f * (1.0 - f);
+  float a = h21(p), b = h21(p + vec2(1.0, 0.0)), c = h21(p + vec2(0.0, 1.0)), d = h21(p + vec2(1.0, 1.0));
+  return vec3(a + (b - a) * u.x + (c - a) * u.y + (a - b - c + d) * u.x * u.y,
+              du * (vec2(b - a, c - a) + (a - b - c + d) * u.yx));
+}
+float eroded(vec2 x, int oct) {
+  vec2 p = x * 0.42;
+  float a = 0.0, b = 1.0;
+  vec2 d = vec2(0.0);
+  for (int i = 0; i < 11; i++) {
+    if (i >= oct) break;
+    vec3 n = noised(p);
+    n = vec3(n.x * 2.0 - 1.0, n.yz * 2.0);
+    d += n.yz;
+    a += b * n.x / (1.0 + dot(d, d));
+    b *= 0.5;
+    p = M2 * p * 2.0;
+  }
+  return a;
+}
+float terrain(vec2 x, int oct) {
+  float r = length((x - PEAK) * vec2(1.0, 0.8));
+  // one tall, sharp summit with a long shoulder; a quiet valley floor in front; low ranges far behind
+  float summit = 4.6 * pow(max(0.0, 1.0 - r / 5.2), 2.1) + 1.2 * exp(-r * r / 30.0)
+               + 1.0 * pow(max(0.0, 1.0 - length(x - PEAK - vec2(-3.2, 1.5)) / 3.5), 2.0);
+  float ranges = 0.75 * smoothstep(16.0, 34.0, x.y) * (0.6 + 0.4 * sin(x.x * 0.15 + 1.0));
+  float nearCalm = 0.12 + 0.88 * smoothstep(3.0, 11.0, x.y);           // gentle snowfield close to us
+  float detail = eroded(x, oct) * nearCalm * (0.45 + 0.75 * exp(-r * r / 14.0) + 0.5 * smoothstep(16.0, 34.0, x.y));
+  return summit + ranges + detail - 0.55 - 0.25 * (1.0 - smoothstep(2.0, 9.0, x.y));
+}
+vec3 calcNormal(vec3 p, float t) {
+  vec2 e = vec2(0.0015 * t + 0.002, 0.0);
+  int oct = int(mix(10.0, 5.0, clamp(t / 40.0, 0.0, 1.0)));
+  return normalize(vec3(terrain(p.xz - e.xy, oct) - terrain(p.xz + e.xy, oct), 2.0 * e.x,
+                        terrain(p.xz - e.yx, oct) - terrain(p.xz + e.yx, oct)));
+}
+float march(vec3 ro, vec3 rd) {
+  float t = 0.3;
+  for (int i = 0; i < 160; i++) {
+    vec3 p = ro + rd * t;
+    float h = p.y - terrain(p.xz, 6);
+    if (abs(h) < 0.0015 * t || t > 60.0) break;
+    t += 0.45 * h;
+  }
+  return t;
+}
+float shadow(vec3 p) {
+  float res = 1.0, t = 0.08;
+  for (int i = 0; i < 28; i++) {
+    vec3 q = p + LIGHT * t;
+    float h = q.y - terrain(q.xz, 4);
+    res = min(res, 10.0 * h / t);
+    t += clamp(h, 0.06, 0.6);
+    if (res < 0.0 || t > 14.0) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+float sky(vec3 rd, vec2 uv) {
+  float up = rd.y;
+  float L = 0.008 + 0.05 * exp(-max(up, 0.0) * 9.0);
+  float m = dot(rd, MOON);
+  L += 0.05 * pow(max(m, 0.0), 12.0) * (1.0 + 0.3 * uEnergy) + 0.35 * pow(max(m, 0.0), 400.0);
+  // Milky Way and stars on a direction-fixed sky
+  vec2 su = vec2(atan(rd.x, rd.z), up) * 1.4;
+  vec2 bd = normalize(vec2(0.5, 1.0));
+  float band = exp(-pow(dot(su - vec2(0.35, 0.1), vec2(bd.y, -bd.x)) / 0.22, 2.0));
+  L += band * (0.03 * smoothstep(0.4, 0.8, fbm(su * 4.0 + 2.0)) + 0.008);
+  float st = stars(su) + band * starLayer(su, 160.0, 3.7, 0.08) * 0.7 * uDetail;
+  L += st * smoothstep(0.0, 0.12, up) * (1.0 - smoothstep(0.996, 0.9995, m)) * (1.0 + 0.5 * uEnergy);
+  // the moon: a slightly mottled disc
+  float disc = smoothstep(0.99955, 0.99965, m);
+  L = mix(L, 2.2 * (0.82 + 0.18 * fbm(su * 160.0)), disc);
+  // a meteor now and then: thin, sharp head, tapering trail, about half a second
+  float period = 23.0;
+  float slot = floor(uTime / period), ph = fract(uTime / period) * period;
+  if (ph < 0.7 && h21(vec2(slot, 4.0)) > 0.35) {
+    float u = ph / 0.7;
+    vec2 a = vec2(mix(-0.6, 0.6, h21(vec2(slot, 1.0))), 0.28 + 0.15 * h21(vec2(slot, 2.0)));
+    vec2 dir = normalize(vec2(mix(-1.0, 1.0, step(0.5, h21(vec2(slot, 3.0)))) * 0.85, -0.42));
+    vec2 head = a + dir * u * 0.3;
+    vec2 rel = uv - head;
+    float along = dot(rel, -dir), across = abs(dot(rel, vec2(-dir.y, dir.x))) * uRes.y;   // px
+    float len = 0.12 * sin(u * 3.14159);
+    float trail = step(0.0, along) * (1.0 - smoothstep(0.0, len, along)) * pow(1.0 - along / max(len, 1e-3), 2.0);
+    float core = exp(-across * across * 1.2);
+    float headGlow = exp(-dot(rel, rel) * uRes.y * uRes.y * 0.4);
+    L += (trail * core * 0.6 + headGlow * 1.2) * sin(u * 3.14159) * smoothstep(0.0, 0.1, up);
+  }
+  return L;
+}
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+  float asp = uRes.x / uRes.y;
+  bool wide = asp > 1.15;
+  // camera: low in the valley, looking up the glacier at the peak (right of the card on wide screens)
+  vec3 ro = vec3(uLook.x * 0.25, 1.15 + uLook.y * 0.06, -2.0);
+  vec3 ta = wide ? vec3(0.4, 1.75, 8.0) : vec3(3.6, 2.6, 8.0);
+  vec3 ww = normalize(ta - ro), uu = normalize(cross(vec3(0.0, 1.0, 0.0), ww)), vv = cross(ww, uu);
+  vec3 rd = normalize(uv.x * uu + uv.y * vv + 1.7 * ww);
+
+  float t = march(ro, rd);
+  float L;
+  if (t > 60.0) {
+    L = sky(rd, uv);
+  } else {
+    vec3 p = ro + rd * t;
+    vec3 n = calcNormal(p, t);
+    float sh = shadow(p + n * 0.01);
+    float dif = max(dot(n, LIGHT), 0.0) * sh;
+    // snow settles where the slope lets it, and more of it higher up; steep faces stay dark rock
+    float slope = n.y;
+    float hgt = p.y;
+    float snowN = fbm3(p.xz * 3.0);
+    float snow = smoothstep(0.68, 0.9, slope + 0.07 * hgt - 0.12 + 0.3 * (snowN - 0.5));
+    float alb = mix(0.045, 0.8, snow);
+    float amb = 0.028 * (0.4 + 0.6 * n.y);
+    float bounce = 0.02 * max(-n.y, 0.0);
+    L = alb * (dif * 0.62 + amb + bounce);
+    // the valley floor close by sits in the mountain's shadow and the night
+    L *= mix(0.35, 1.0, smoothstep(3.0, 14.0, t));
+    // sparkle on lit snow (fine ice catching the moon)
+    L += snow * dif * 0.25 * pow(max(dot(reflect(rd, n), LIGHT), 0.0), 40.0);
+    // haze with distance, a little brighter towards the moon
+    float m = max(dot(rd, MOON), 0.0);
+    vec3 fogCol = vec3(0.03 + 0.05 * pow(m, 6.0));
+    L = mix(L, fogCol.x, 1.0 - exp(-t * 0.028));
+  }
+  // valley mist: dense low down, drifting, lit by the moon
+  float fogH = 0.7;
+  float yd = max(rd.y, 0.001);
+  float tm = min(t, 60.0);
+  float mist = 0.3 * exp(-max(ro.y - fogH, 0.0) * 1.6) * (1.0 - exp(-tm * yd * 1.6)) / (yd * 1.6);
+  mist *= 0.55 + 0.45 * fbm3(vec2(rd.x * 6.0 + uTime * 0.01, rd.y * 18.0 - uTime * 0.004));
+  L += clamp(mist, 0.0, 1.0) * (0.035 + 0.05 * pow(max(dot(rd, MOON), 0.0), 5.0));
+  gl_FragColor = outLum(L);
+}`,
+    sea: `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform vec2  uRes;
+uniform float uTime;
+uniform float uEnergy;
+uniform vec2  uLook;
+uniform float uDetail;
+
+float h21(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+vec2 h22(vec2 p) { float n = h21(p); return vec2(n, h21(p + n + 3.1)); }
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), f.x), mix(h21(i + vec2(0.0, 1.0)), h21(i + 1.0), f.x), f.y);
+}
+float fbm(vec2 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) { s += a * vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p + 7.7; a *= 0.5; }
+  return s;
+}
+float fbm3(vec2 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 3; i++) { s += a * vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p + 7.7; a *= 0.5; }
+  return s;
+}
+// 1D terrain noise along x
+float n1(float x, float seed) { return vnoise(vec2(x, seed)); }
+float ridge1(float x, float seed) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) { s += a * (1.0 - abs(2.0 * n1(x, seed) - 1.0)); x = x * 2.07 + 3.1; a *= 0.5; }
+  return s;
+}
+// Point stars, one per cell, a few bright, most faint; sharp to a pixel; gentle twinkle.
+float starLayer(vec2 uv, float scale, float seed, float keep) {
+  vec2 g = uv * scale + seed;
+  vec2 id = floor(g);
+  vec2 o = h22(id) - 0.5;
+  float b = h21(id + 11.3);
+  vec2 d = (fract(g) - 0.5 - o * 0.8) / scale * uRes.y;     // pixels
+  float tw = 0.75 + 0.25 * sin(uTime * (1.5 + 3.0 * b) + b * 40.0);
+  float s = (b - (1.0 - keep)) / keep;                     // only a fraction 'keep' of cells holds a star
+  return step(0.0, s) * (0.15 + 0.85 * pow(max(s, 0.0), 3.0)) * exp(-dot(d, d) * 1.7) * 2.2 * tw;
+}
+float stars(vec2 uv) {
+  return starLayer(uv, 30.0, 0.0, 0.16) + starLayer(uv, 64.0, 5.3, 0.07) * 0.7 + starLayer(uv, 130.0, 9.1, 0.03) * 0.5 * uDetail;
+}
+// Same output format as the black hole: R display value, G linear luminance / 5 for bloom.
+vec4 outLum(float L) {
+  float c = L * 1.15;
+  float tm = (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14);
+  return vec4(clamp(tm, 0.0, 1.0), clamp(c * 0.2, 0.0, 1.0), 0.0, 1.0);
+}
+
+// Moonlit Sea: a calm ocean, a low moon and its broken road of light.
+float clouds(vec2 p, float t) { return smoothstep(0.42, 0.78, fbm(p * vec2(1.3, 4.0) + vec2(t * 0.006, 0.0))); }
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+  float asp = uRes.x / uRes.y;
+  bool wide = asp > 1.15;
+  float hz = (wide ? -0.07 : 0.02) + uLook.y * 0.004;
+  vec2 moon = wide ? vec2(0.33 * asp, 0.20) : vec2(0.18, 0.36);
+  float t = uTime;
+  float L;
+  if (uv.y > hz) {
+    vec2 su = uv;
+    float dm = length(su - moon);
+    L = 0.012 + 0.07 * exp(-(uv.y - hz) * 7.0) + 0.14 * exp(-dm * 6.0) * (1.0 + 0.25 * uEnergy) + 0.3 * exp(-dm * 28.0);
+    L += stars(su) * smoothstep(0.05, 0.25, dm) * smoothstep(hz, hz + 0.1, uv.y) * (1.0 + 0.5 * uEnergy);
+    float c = clouds(su, t);
+    // dense cores dark, thin edges near the moon lit silver
+    float edge = c * (1.0 - c) * 4.0;
+    float cl = 0.015 + 0.6 * exp(-dm * 4.5) * (0.35 + edge);
+    L = mix(L, cl, c * 0.92);
+    float mr = 0.036;
+    float disc = smoothstep(mr, mr - 0.0025, dm) * (1.0 - c * 0.85);
+    L = mix(L, 2.4 * (0.84 + 0.16 * fbm(su * 80.0)), disc);
+    // haze sitting on the horizon
+    L += 0.05 * exp(-(uv.y - hz) * 40.0);
+  } else {
+    float depth = hz - uv.y;                                  // 0 at the horizon
+    float z = 0.12 / max(depth, 0.002);                      // distance
+    vec2 w = vec2((uv.x - moon.x) * z, z);
+    // waves: two wind directions, moving
+    vec2 p1 = w * vec2(2.6, 7.0) + vec2(t * 0.15, t * 0.45);
+    vec2 p2 = w * vec2(6.5, 15.0) + vec2(-t * 0.2, t * 0.7);
+    float e = 0.05;
+    float hgt = fbm3(p1) + 0.5 * fbm3(p2);
+    float hx = fbm3(p1 + vec2(e, 0.0)) + 0.5 * fbm3(p2 + vec2(e, 0.0)) - hgt;
+    float hy = fbm3(p1 + vec2(0.0, e)) + 0.5 * fbm3(p2 + vec2(0.0, e)) - hgt;
+    // reflected sky: brighter towards the horizon (fresnel), darker close by
+    float fres = exp(-depth * 9.0);
+    L = 0.006 + 0.07 * fres;
+    // the moon's road: wider close to us, broken into glints by the wave slopes
+    float wdt = 0.012 + 0.55 * depth;
+    float road = exp(-pow((uv.x - moon.x + hx * 0.35 * depth * 4.0) / wdt, 2.0));
+    float glint = smoothstep(0.004, 0.03, -hy * (1.0 + depth * 6.0)) ;
+    float sparkle = pow(clamp(hgt - 0.35, 0.0, 1.0) * 2.0, 3.0);
+    L += road * (0.08 * fres + glint * (0.6 + 1.6 * sparkle) * (1.0 + 0.5 * uEnergy)) * (1.0 - 0.6 * smoothstep(0.0, 0.45, depth));
+    L += road * 0.25 * exp(-depth * 60.0);                    // the bright band right under the horizon
+    // a faint swell structure everywhere
+    L += 0.012 * smoothstep(0.0, 0.05, -hy) * (1.0 - smoothstep(0.0, 0.3, depth));
+  }
+  gl_FragColor = outLum(L);
+}`,
+    nebula: `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform vec2  uRes;
+uniform float uTime;
+uniform float uEnergy;
+uniform vec2  uLook;
+uniform float uDetail;
+
+float h21(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+vec2 h22(vec2 p) { float n = h21(p); return vec2(n, h21(p + n + 3.1)); }
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), f.x), mix(h21(i + vec2(0.0, 1.0)), h21(i + 1.0), f.x), f.y);
+}
+float fbm(vec2 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) { s += a * vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p + 7.7; a *= 0.5; }
+  return s;
+}
+float fbm3(vec2 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 3; i++) { s += a * vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p + 7.7; a *= 0.5; }
+  return s;
+}
+// 1D terrain noise along x
+float n1(float x, float seed) { return vnoise(vec2(x, seed)); }
+float ridge1(float x, float seed) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) { s += a * (1.0 - abs(2.0 * n1(x, seed) - 1.0)); x = x * 2.07 + 3.1; a *= 0.5; }
+  return s;
+}
+// Point stars, one per cell, a few bright, most faint; sharp to a pixel; gentle twinkle.
+float starLayer(vec2 uv, float scale, float seed, float keep) {
+  vec2 g = uv * scale + seed;
+  vec2 id = floor(g);
+  vec2 o = h22(id) - 0.5;
+  float b = h21(id + 11.3);
+  vec2 d = (fract(g) - 0.5 - o * 0.8) / scale * uRes.y;     // pixels
+  float tw = 0.75 + 0.25 * sin(uTime * (1.5 + 3.0 * b) + b * 40.0);
+  float s = (b - (1.0 - keep)) / keep;                     // only a fraction 'keep' of cells holds a star
+  return step(0.0, s) * (0.15 + 0.85 * pow(max(s, 0.0), 3.0)) * exp(-dot(d, d) * 1.7) * 2.2 * tw;
+}
+float stars(vec2 uv) {
+  return starLayer(uv, 30.0, 0.0, 0.16) + starLayer(uv, 64.0, 5.3, 0.07) * 0.7 + starLayer(uv, 130.0, 9.1, 0.03) * 0.5 * uDetail;
+}
+// Same output format as the black hole: R display value, G linear luminance / 5 for bloom.
+vec4 outLum(float L) {
+  float c = L * 1.15;
+  float tm = (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14);
+  return vec4(clamp(tm, 0.0, 1.0), clamp(c * 0.2, 0.0, 1.0), 0.0, 1.0);
+}
+
+// Deep Field: slow gas and dust lit by one bright young star.
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+  float asp = uRes.x / uRes.y;
+  bool wide = asp > 1.15;
+  vec2 core = wide ? vec2(0.3 * asp, 0.05) : vec2(0.1, 0.3);
+  float t = uTime * 0.012;
+  vec2 p = uv + uLook * 0.006;
+  // domain-warped gas, drifting
+  vec2 q = vec2(fbm(p * 1.6 + vec2(0.0, t)), fbm(p * 1.6 + vec2(5.2, 1.3 - t)));
+  vec2 r = vec2(fbm(p * 1.6 + 3.5 * q + vec2(1.7, 9.2) + t * 0.6), fbm(p * 1.6 + 3.5 * q + vec2(8.3, 2.8)));
+  float gas = fbm(p * 2.0 + 3.0 * r);
+  float dc = length(p - core);
+  float light = 0.45 + 1.5 * exp(-dc * 2.0) * (1.0 + 0.35 * uEnergy);
+  float L = pow(smoothstep(0.25, 0.85, gas), 2.0) * 0.55 * light + 0.02 * fbm(p * 6.0) * light;
+  // dark dust lanes in front of the gas
+  float dust = smoothstep(0.5, 0.75, fbm(p * 3.2 + 2.0 * q + 11.0));
+  L *= 1.0 - 0.85 * dust;
+  // rim-lit gas edges facing the star
+  L += 0.08 * smoothstep(0.55, 0.65, gas) * (1.0 - smoothstep(0.65, 0.8, gas)) * exp(-dc * 2.0);
+  L += stars(p) * (1.0 - 0.8 * dust);
+  // the star itself, with diffraction spikes
+  vec2 d = (p - core) * uRes.y;
+  float spikes = (exp(-abs(d.x) * 0.9) * exp(-abs(d.y) * 0.012) + exp(-abs(d.y) * 0.9) * exp(-abs(d.x) * 0.012)) * 0.9;
+  L += 3.0 * exp(-dot(d, d) * 0.02) + spikes * (1.0 + 0.5 * uEnergy) + 0.25 * exp(-dc * 9.0);
+  gl_FragColor = outLum(L);
+}`,
+  };
+  const SCENES = [
+    { id: 'horizon', name: 'Event Horizon' },
+    { id: 'mountain', name: 'Lonely Mountain' },
+    { id: 'sea', name: 'Moonlit Sea' },
+    { id: 'nebula', name: 'Deep Field' },
+  ];
+
   // ---------------------------------------------------------------- post-processing (all WebGL1 / GLSL ES 1.00)
   // The scene is traced into an RGBA8 texture (R = tone-mapped value, G = linear luminance / 5). A dual-filter
   // pyramid (1/2 .. 1/32) then carries three things at once, since the image is monochrome:
@@ -391,7 +801,11 @@ void main() {
     return { p, u };
   }
 
-  const noop = { frame() {}, setEnergy() {}, setLook() {}, setRain() {}, stats() { return null; }, ok: false };
+  // The size of the "view": the window, or the recording frame when the body is framed (see styles.css).
+  const viewSize = () => (document.body && document.body.classList.contains('framed')
+    ? [document.body.clientWidth, document.body.clientHeight] : [innerWidth, innerHeight]);
+
+  const noop = { frame() {}, setEnergy() {}, setLook() {}, setRain() {}, setScene() {}, stats() { return null; }, ok: false };
   const LEVELS = 5;   // pyramid 1/2 .. 1/32
 
   // opts.scale: fixed render scale (disables adaptive resolution), used to render stills.
@@ -416,7 +830,7 @@ void main() {
       gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
       gl.disable(gl.DEPTH_TEST);
       gl.disable(gl.BLEND);
-      G = { scene, down, up, comp, targets: null, tw: 0, th: 0 };
+      G = { scene, scenes: { horizon: scene }, pending: {}, down, up, comp, targets: null, tw: 0, th: 0 };
     }
 
     function target(tw, th) {
@@ -463,8 +877,9 @@ void main() {
     let scale = opts.scale || Math.min(maxScale, 0.75);
     let w = 0, h = 0;
     const resize = () => {
-      w = Math.max(2, Math.round(innerWidth * scale));
-      h = Math.max(2, Math.round(innerHeight * scale));
+      const [vw, vh] = viewSize();
+      w = Math.max(2, Math.round(vw * scale));
+      h = Math.max(2, Math.round(vh * scale));
       if (canvas.width !== w || canvas.height !== h) {
         canvas.width = w;
         canvas.height = h;
@@ -496,6 +911,43 @@ void main() {
     let ceiling = Infinity;      // lowest scale that proved too slow
     let frameNo = 0;
     let hole = { x: 0, y: 0 };   // black-hole centre in pixels, for the lens focus
+    let sceneId = 'horizon', shownId = 'horizon';
+    // Background programs compile on first use. Compiling one blocks for a few hundred ms, so where the browser
+    // can compile in the background (KHR_parallel_shader_compile) the old scene keeps drawing until the new one is
+    // ready, and the others are pre-compiled shortly after start-up. Falls back to the black hole on failure.
+    const par = gl.getExtension('KHR_parallel_shader_compile');
+    const SCENE_U = ['uRes', 'uTime', 'uEnergy', 'uLook', 'uDetail'];
+    function startScene(id) {
+      if (!G || G.scenes[id] || G.pending[id] || !SCENE_SRC[id]) return;
+      const p = gl.createProgram();
+      [[gl.VERTEX_SHADER, VERT], [gl.FRAGMENT_SHADER, SCENE_SRC[id]]].forEach(([type, src]) => {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        gl.attachShader(p, s);
+      });
+      gl.bindAttribLocation(p, 0, 'aPos');
+      gl.linkProgram(p);
+      G.pending[id] = p;
+    }
+    function sceneProgram() {
+      if (!G.scenes[sceneId]) {
+        startScene(sceneId);
+        const p = G.pending[sceneId];
+        if (p && par && !gl.getProgramParameter(p, par.COMPLETION_STATUS_KHR)) return G.scenes[shownId] ? [shownId, G.scenes[shownId]] : ['horizon', G.scenes.horizon];
+        delete G.pending[sceneId];
+        if (p && gl.getProgramParameter(p, gl.LINK_STATUS)) {
+          const u = {};
+          SCENE_U.forEach((n) => { u[n] = gl.getUniformLocation(p, n); });
+          G.scenes[sceneId] = { p, u };
+        } else {
+          console.warn('[space] scene failed: ' + sceneId, p && gl.getProgramInfoLog(p));
+          sceneId = 'horizon';
+        }
+      }
+      shownId = sceneId;
+      return [sceneId, G.scenes[sceneId]];
+    }
 
     function bindTarget(t) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, t ? t.fb : null);
@@ -603,11 +1055,16 @@ void main() {
       if (aspect > 1.15) { cx = aspect * 0.5 * 0.6; cy = 0.03; zoom = 3.0; dist = 26.0; }
       else { cx = 0.0; cy = 0.27; zoom = 1.45; dist = 38.0; }
       hole = { x: w * 0.5 + cx * h, y: h * 0.5 + cy * h };
+      // Lens focus for the other backgrounds: where the eye goes (the peak, the moon, the star).
+      const wide = aspect > 1.15;
+      const [drawId, prog] = sceneProgram();
+      const focus = { mountain: wide ? [0.31 * aspect, 0.2] : [0.12, 0.3], sea: wide ? [0.33 * aspect, 0.2] : [0.18, 0.36], nebula: wide ? [0.3 * aspect, 0.05] : [0.1, 0.3] }[drawId];
+      if (focus) hole = { x: w * 0.5 + focus[0] * h, y: h * 0.5 + focus[1] * h };
 
       const t = (now - t0) / 1000 * (reduced ? 0.25 : 1);
-      const su = G.scene.u;
+      const su = prog.u;
       bindTarget(G.targets.scene);
-      gl.useProgram(G.scene.p);
+      gl.useProgram(prog.p);
       gl.uniform2f(su.uRes, w, h);
       gl.uniform1f(su.uTime, t + 40.0);
       gl.uniform1f(su.uEnergy, energy);
@@ -620,7 +1077,11 @@ void main() {
 
       post(now, true);
 
-      if (firstFrame) { firstFrame = false; canvas.classList.add('ready'); }
+      if (firstFrame) {
+        firstFrame = false;
+        canvas.classList.add('ready');
+        if (par) setTimeout(() => Object.keys(SCENE_SRC).forEach(startScene), 4000);
+      }
     }
 
     return {
@@ -629,9 +1090,12 @@ void main() {
       setEnergy(e) { energy = e; },
       setLook(x, y) { look.tx = x; look.ty = y; },
       setRain(level) { rainTarget = Math.min(1, Math.max(0, +level || 0)); },
+      setScene(id) { if (id === 'horizon' || SCENE_SRC[id]) sceneId = id; },
+      get scene() { return sceneId; },
+      get shownScene() { return shownId; },   // what is actually on screen (lags while a scene compiles)
       stats() { return { scale: +scale.toFixed(3), skip, w, h, adjustments, refresh: +refresh.toFixed(1), ceiling: isFinite(ceiling) ? +ceiling.toFixed(3) : null, rain: +rain.toFixed(3), lost }; },
     };
   }
 
-  return { create };
+  return { create, SCENES };
 })();

@@ -19,7 +19,7 @@
     addBtn: $('#addBtn'), folderBtn: $('#folderBtn'), shuffle: $('#shuffle'), repeat: $('#repeat'),
     mute: $('#mute'), volume: $('#volume'), mono: $('#mono'), queueBtn: $('#queueBtn'),
     queue: $('#queue'), qList: $('#qList'), qMeta: $('#qMeta'), qAdd: $('#qAdd'), qClear: $('#qClear'), qClose: $('#qClose'),
-    toast: $('#toast'), rain: $('#rain'), rainBtn: $('#rainBtn'), dock: $('.dock'), fileInput: $('#fileInput'), folderInput: $('#folderInput'), space: $('#space'),
+    toast: $('#toast'), rain: $('#rain'), rainBtn: $('#rainBtn'), sceneBtn: $('#sceneBtn'), recBtn: $('#recBtn'), recMenu: $('#recMenu'), recNow: $('#recNow'), recSong: $('#recSong'), dock: $('.dock'), fileInput: $('#fileInput'), folderInput: $('#folderInput'), space: $('#space'),
   };
 
   const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -39,6 +39,7 @@
     muted: !!session.muted,
     mono: session.mono !== false,
     rain: !!session.rain,
+    scene: typeof session.scene === 'string' ? session.scene : 'horizon',
   };
 
   /* ------------------------------------------------------------------ Utils */
@@ -68,7 +69,7 @@
         id: current() ? current().id : null,
         time: audio.currentTime || 0,
         volume: state.volume, muted: state.muted,
-        shuffle: state.shuffle, repeat: state.repeat, mono: state.mono, rain: state.rain,
+        shuffle: state.shuffle, repeat: state.repeat, mono: state.mono, rain: state.rain, scene: state.scene, recShape: state.recShape,
       }));
     } catch { /* storage full or blocked */ }
   }
@@ -156,7 +157,8 @@
   const DEFAULT_COVER = genCover('event-horizon');
 
   /* ------------------------------------------------------------------ Audio graph */
-  let actx = null, analyser = null, gain = null, timeBuf = null, freqBuf = null;
+  let actx = null, analyser = null, gain = null, timeBuf = null, freqBuf = null, recTap = null;
+  let rec = null;   // the running recording (see Recording below)
   function ensureGraph() {
     if (actx) return;
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -171,6 +173,9 @@
       src.connect(analyser);
       analyser.connect(gain);
       gain.connect(actx.destination);
+      // Tap for the recorder: the signal before the volume control, so recordings are clean and full level
+      // whatever the volume or mute state.
+      if (actx.createMediaStreamDestination) { recTap = actx.createMediaStreamDestination(); analyser.connect(recTap); }
       timeBuf = new Float32Array(analyser.fftSize);
       freqBuf = new Uint8Array(analyser.frequencyBinCount);
       audio.volume = 1;
@@ -496,6 +501,7 @@
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = on ? 'playing' : 'paused';
     const t = current();
     document.title = t ? (on ? '▶ ' : '') + t.title + ' · ' + t.artist : 'Event Horizon';
+    if (rec) { rec.title = document.title; updateRecTitle(); }
     wake();
   }
 
@@ -503,6 +509,7 @@
   audio.addEventListener('pause', () => { setPlaying(false); saveSession(); });
   audio.addEventListener('playing', () => { errorStreak = 0; });
   audio.addEventListener('ended', () => {
+    if (rec && rec.song) stopRecording();   // "record this song" ends with the song
     if (state.repeat === 'one') { audio.currentTime = 0; play(); return; }
     step(1, true);
   });
@@ -552,8 +559,11 @@
     if (firstShow || reduced || document.hidden) { firstShow = false; applyTrack(t); return; }
     const targets = [el.coverImg, el.title, el.artist, el.album];
     const dx = 16 * dir;
+    // The animated filter replaces the cover's CSS grayscale while it runs; keep it in the keyframes, or the new
+    // cover shows in colour and then crawls to grey through the CSS filter transition.
+    const base = (n) => (n === el.coverImg && !body.classList.contains('color-art') ? 'grayscale(1) contrast(1.12) ' : '');
     const fadeOut = Promise.all(targets.map((n) => n.animate(
-      [{ opacity: 1, filter: 'blur(0px)', transform: 'none' }, { opacity: 0, filter: 'blur(8px)', transform: 'translateX(' + -dx + 'px)' }],
+      [{ opacity: 1, filter: base(n) + 'blur(0px)', transform: 'none' }, { opacity: 0, filter: base(n) + 'blur(8px)', transform: 'translateX(' + -dx + 'px)' }],
       { duration: 200, easing: 'cubic-bezier(.7,0,.84,0)', fill: 'forwards' }).finished.catch(() => {})
     ));
     // Never let a stalled animation keep stale track info on screen.
@@ -563,7 +573,7 @@
       targets.forEach((n, i) => {
         n.getAnimations().forEach((a) => a.cancel());
         n.animate(
-          [{ opacity: 0, filter: 'blur(8px)', transform: 'translateX(' + dx + 'px)' }, { opacity: 1, filter: 'blur(0px)', transform: 'none' }],
+          [{ opacity: 0, filter: base(n) + 'blur(8px)', transform: 'translateX(' + dx + 'px)' }, { opacity: 1, filter: base(n) + 'blur(0px)', transform: 'none' }],
           { duration: 520, delay: i * 45, easing: 'cubic-bezier(.16,1,.3,1)', fill: 'backwards' });
       });
     });
@@ -986,19 +996,18 @@
       }
     } catch { /* storage blocked */ }
   }
-  // Rain on the glass. It refracts the live scene, so it needs the WebGL renderer too.
+  // Rain falling past the window and running down the glass. It refracts the live scene, so it needs the WebGL renderer too.
   const rain = space.ok && window.Rain
-    ? Rain.create(el.rain, el.space, {
-      masks: [el.card, el.dock],
+    ? Rain.create(el.rain, {
+      scene: el.space, face: el.face, dock: el.dock, card: $('#rainCard'),
       quality: () => (space.stats ? space.stats().scale / 0.75 : 1),
-      fog: () => (space.stats ? space.stats().rain || 0 : 0),   // how fogged the scene canvas is (space.setRain)
     })
     : { ok: false, enabled: false, frame() {}, setEnabled() {} };
   if (!rain.ok) el.rainBtn.hidden = true;
   function applyRain() {
     const on = state.rain && rain.ok;
     rain.setEnabled(on);
-    if (space.setRain) space.setRain(on ? 1 : 0);
+    if (space.setRain) space.setRain(on ? 0.35 : 0);   // the scene seen through wet glass: softer, with more halation
     el.rainBtn.setAttribute('aria-pressed', String(on));
   }
   function toggleRain() {
@@ -1008,6 +1017,237 @@
     toast(state.rain ? 'Rain on' : 'Rain off', 1400);
     saveSession();
   }
+
+  // Backgrounds. The canvas dips to black and comes back on the new scene (a new scene compiles on first use,
+  // which can take a moment; the dip hides it).
+  const SCENES = (window.Space && Space.SCENES) || [{ id: 'horizon', name: 'Event Horizon' }];
+  if (!space.ok || SCENES.length < 2) el.sceneBtn.hidden = true;
+  if (!SCENES.some((s) => s.id === state.scene)) state.scene = 'horizon';
+  if (space.setScene) space.setScene(state.scene);
+  let sceneTimer = 0;
+  function cycleScene(dir = 1) {
+    if (!space.ok) return;
+    const i = SCENES.findIndex((s) => s.id === state.scene);
+    const next = SCENES[(i + dir + SCENES.length) % SCENES.length];
+    state.scene = next.id;
+    toast(next.name, 1600);
+    saveSession();
+    clearTimeout(sceneTimer);
+    if (reduced) { space.setScene(next.id); return; }
+    el.space.classList.add('scened', 'swap');
+    sceneTimer = setTimeout(() => {
+      space.setScene(state.scene);
+      // Come back once the new scene is actually drawn (it may still be compiling), but never wait forever.
+      const t0 = performance.now();
+      (function wait() {
+        if (space.shownScene === state.scene || performance.now() - t0 > 3000) {
+          requestAnimationFrame(() => el.space.classList.remove('swap'));
+        } else requestAnimationFrame(wait);
+      })();
+    }, 420);
+  }
+
+  /* ------------------------------------------------------------------ Recording */
+  // Records the site as a video in an aspect ratio of choice.
+  // The whole site is laid out inside a frame of that shape (body.framed: the body becomes the view that layout,
+  // container queries, the scene and the rain size themselves to), the browser captures this tab, and each captured
+  // frame is cropped to the frame and scaled to a standard size on a canvas. The audio comes straight from the
+  // player's Web Audio graph, before the volume control. The dock button opens a picker (choosing a shape previews
+  // it); V starts/stops with the last shape, Shift+V records the current song from the start and stops at its end.
+  // While recording the dock, toasts and cursor are hidden and the tab title shows a red dot.
+  const SHAPES = {
+    window: { label: 'Window', size: null },
+    '16:9': { label: '16:9', size: [1920, 1080] },
+    '9:16': { label: '9:16', size: [1080, 1920] },
+    '1:1': { label: '1:1', size: [1080, 1080] },
+    '4:5': { label: '4:5', size: [1080, 1350] },
+    '21:9': { label: '21:9', size: [2560, 1080] },
+  };
+  state.recShape = SHAPES[session.recShape] ? session.recShape : '16:9';
+  const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia && window.MediaRecorder);
+  if (!canRecord) el.recBtn.hidden = true;
+
+  function applyFrame(shape) {
+    const s = SHAPES[shape];
+    if (!s || !s.size) { clearFrame(); return; }
+    const a = s.size[0] / s.size[1];
+    const W = innerWidth, H = innerHeight;
+    const fw = Math.round(W / H > a ? H * a : W), fh = Math.round(W / H > a ? H : W / a);
+    const st = document.body.style;
+    st.setProperty('--fw', fw + 'px'); st.setProperty('--fh', fh + 'px');
+    st.setProperty('--fx', Math.round((W - fw) / 2) + 'px'); st.setProperty('--fy', Math.round((H - fh) / 2) + 'px');
+    body.classList.add('framed');
+    dispatchEvent(new Event('resize'));
+  }
+  function clearFrame() {
+    if (!body.classList.contains('framed')) return;
+    body.classList.remove('framed');
+    dispatchEvent(new Event('resize'));
+  }
+  // Keep the frame fitted when the window changes size (a real resize, not the ones we dispatch).
+  addEventListener('resize', (e) => { if (e.isTrusted && body.classList.contains('framed')) applyFrame(rec ? rec.shape : state.recShape); });
+
+  // ---- picker
+  const menu = el.recMenu;
+  function renderMenu() {
+    menu.querySelectorAll('[data-shape]').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.shape === state.recShape)));
+    el.recSong.disabled = !hasTrack();
+  }
+  function openMenu() {
+    renderMenu();
+    menu.hidden = false;
+    const b = el.recBtn.getBoundingClientRect(), v = document.body.getBoundingClientRect();
+    const half = Math.min(150, v.width / 2 - 8);      // keep the panel inside the (possibly narrow) frame
+    menu.style.width = half * 2 + 'px';
+    menu.style.left = Math.round(Math.min(Math.max(b.left + b.width / 2 - v.left, half + 8), v.width - half - 8)) + 'px';
+    menu.style.bottom = Math.round(v.bottom - b.top + 12) + 'px';
+    applyFrame(state.recShape);                          // preview the composition
+    menu.querySelector('[aria-checked="true"]').focus();
+  }
+  function closeMenu(keepFrame = false) {
+    if (menu.hidden) return;
+    menu.hidden = true;
+    if (!keepFrame && !rec) clearFrame();
+  }
+  menu.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-shape]');
+    if (!b) return;
+    state.recShape = b.dataset.shape;
+    saveSession();
+    renderMenu();
+    applyFrame(state.recShape);
+    // the menu sits on the dock, which moved with the frame
+    openMenu();
+  });
+  el.recNow.addEventListener('click', () => startRecording(false));
+  el.recSong.addEventListener('click', () => startRecording(true));
+  addEventListener('pointerdown', (e) => {
+    if (!menu.hidden && !menu.contains(e.target) && !el.recBtn.contains(e.target)) closeMenu();
+  });
+
+  // ---- recording
+  function pickMime() {
+    const types = ['video/mp4;codecs=avc1.640033,mp4a.40.2', 'video/mp4;codecs=avc1,opus', 'video/mp4',
+      'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+    return types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+  }
+  function fileName(ext, shape) {
+    const t = current();
+    const base = t ? (t.artist ? t.artist + ' - ' : '') + t.title : 'Event Horizon';
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+    const tag = shape === 'window' ? '' : ' ' + shape.replace(':', 'x');
+    return (base.replace(/[\\/:*?"<>|]+/g, ' ').trim().slice(0, 120) || 'Event Horizon') + tag + ' (' + stamp + ').' + ext;
+  }
+  const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+
+  async function startRecording(song = false) {
+    if (rec || !canRecord) return;
+    if (song && !hasTrack()) { openPicker(); return; }
+    const shape = state.recShape;
+    closeMenu(true);
+    applyFrame(shape);
+    await nextFrame(); await nextFrame();                // let the layout, scene and rain settle in the frame
+    toast('Choose this tab in the next dialog', 3000);
+    let screen;
+    try {
+      screen = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 60 }, width: { ideal: 3840 }, height: { ideal: 2160 }, displaySurface: 'browser', cursor: 'never' },
+        audio: false,
+        preferCurrentTab: true, selfBrowserSurface: 'include', surfaceSwitching: 'exclude', systemAudio: 'exclude',
+      });
+    } catch (err) {
+      clearFrame();
+      toast(err && err.name === 'NotAllowedError' ? 'Recording cancelled' : 'Could not start recording', 2400);
+      return;
+    }
+    ensureGraph();
+    if (actx && actx.state === 'suspended') { try { await actx.resume(); } catch { /* ignore */ } }
+
+    // Video: the captured tab, cropped to the frame and scaled to the shape's size.
+    let video = screen.getVideoTracks()[0], stopDraw = () => {};
+    const size = SHAPES[shape].size;
+    if (size) {
+      const v = document.createElement('video');
+      v.muted = true; v.playsInline = true; v.srcObject = screen;
+      try { await v.play(); } catch { /* starts on the first frame anyway */ }
+      const out = document.createElement('canvas');
+      out.width = size[0]; out.height = size[1];
+      const g = out.getContext('2d', { alpha: false });
+      g.imageSmoothingQuality = 'high';
+      let live = true;
+      const draw = () => {
+        if (!live) return;
+        if (v.videoWidth) {
+          const f = document.body.getBoundingClientRect();
+          const sx = v.videoWidth / innerWidth, sy = v.videoHeight / innerHeight;
+          g.drawImage(v, f.left * sx, f.top * sy, f.width * sx, f.height * sy, 0, 0, out.width, out.height);
+        }
+        if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(draw); else requestAnimationFrame(draw);
+      };
+      draw();
+      video = out.captureStream(60).getVideoTracks()[0];
+      stopDraw = () => { live = false; v.srcObject = null; video.stop(); };
+    }
+    const tracks = [video];
+    if (recTap) tracks.push(...recTap.stream.getAudioTracks());
+    const mimeType = pickMime();
+    let recorder;
+    try {
+      recorder = new MediaRecorder(new MediaStream(tracks), { mimeType, videoBitsPerSecond: 20e6, audioBitsPerSecond: 256000 });
+    } catch (err) {
+      stopDraw();
+      screen.getTracks().forEach((t) => t.stop());
+      clearFrame();
+      toast('This browser can’t record video', 3000);
+      return;
+    }
+    const chunks = [];
+    recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    recorder.onstop = () => {
+      stopDraw();
+      screen.getTracks().forEach((t) => t.stop());
+      const type = recorder.mimeType || mimeType || 'video/webm';
+      const blob = new Blob(chunks, { type });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = fileName(/mp4/.test(type) ? 'mp4' : 'webm', shape);
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+      toast('Saved ' + a.download + ' (' + (blob.size / 1048576).toFixed(1) + ' MB)', 4200);
+    };
+    // "Stop sharing" in the browser's bar ends the recording too.
+    screen.getVideoTracks()[0].addEventListener('ended', () => stopRecording());
+    rec = { recorder, song, shape, title: document.title };
+    body.classList.add('recording');
+    el.recBtn.setAttribute('aria-pressed', 'true');
+    if (song) {
+      // From the very start of the track, after a short beat so the video opens cleanly.
+      audio.pause();
+      audio.currentTime = 0;
+      recorder.start(1000);
+      setTimeout(() => { if (rec) play(); }, 700);
+    } else recorder.start(1000);
+    updateRecTitle();
+  }
+  function stopRecording() {
+    if (!rec) return;
+    const r = rec;
+    rec = null;
+    body.classList.remove('recording');
+    el.recBtn.setAttribute('aria-pressed', 'false');
+    document.title = r.title;
+    if (r.recorder.state !== 'inactive') r.recorder.stop();
+    clearFrame();
+  }
+  function toggleRecording(song = false) { if (rec) stopRecording(); else startRecording(song); }
+  function updateRecTitle() {
+    if (!rec) return;
+    const t = current();
+    document.title = '\u{1F534} REC · ' + (t ? t.title : 'Event Horizon');
+  }
+  el.recBtn.addEventListener('click', () => { if (rec) stopRecording(); else if (menu.hidden) openMenu(); else closeMenu(); });
 
   let lastNow = performance.now();
   const t0 = lastNow;
@@ -1051,6 +1291,7 @@
   el.mute.addEventListener('click', toggleMute);
   el.mono.addEventListener('click', toggleMono);
   el.rainBtn.addEventListener('click', toggleRain);
+  el.sceneBtn.addEventListener('click', (e) => cycleScene(e.shiftKey ? -1 : 1));
   el.queueBtn.addEventListener('click', () => toggleQueue());
   el.qClose.addEventListener('click', () => toggleQueue(false));
   el.qClear.addEventListener('click', clearQueue);
@@ -1104,11 +1345,13 @@
       case 'r': cycleRepeat(); break;
       case 'c': toggleMono(); break;
       case 'w': toggleRain(); break;
+      case 'b': cycleScene(e.shiftKey ? -1 : 1); break;
+      case 'v': toggleRecording(e.shiftKey); break;
       case 'q': toggleQueue(); break;
       case 'o': openPicker(); break;
       case 'n': step(1); break;
       case 'p': prev(); break;
-      case 'Escape': toggleQueue(false); break;
+      case 'Escape': if (!el.recMenu.hidden) closeMenu(); else toggleQueue(false); break;
       default:
         if (/^[0-9]$/.test(k) && hasTrack()) audio.currentTime = trackDuration() * (parseInt(k, 10) / 10);
         else return;
